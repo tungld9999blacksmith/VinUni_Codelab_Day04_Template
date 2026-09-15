@@ -10,11 +10,19 @@ Kiến trúc:
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_support_ticket
+from tools import (
+    TOOL_DEFINITIONS,
+    TOOL_MAP,
+    detect_intent,
+    search_product_catalog,
+    submit_support_ticket,
+    INTENT_DETECTION_DEFINITION
+)
 from google import genai
 from google.genai import types
 
@@ -41,8 +49,11 @@ Chỉ hỗ trợ sản phẩm, dịch vụ và chăm sóc khách hàng của Vin
 ngoài phạm vi, nói rõ giới hạn thay vì suy đoán.
 
 # OUTPUT CONTRACT
-Pipeline xử lý là Intent Detection → tool theo thứ tự → tổng hợp Final Answer.
+Pipeline xử lý là LLM Intent Detection → tool được chọn → tổng hợp Final Answer.
 Không hiển thị suy nghĩ nội bộ; chỉ trả về câu trả lời cuối cùng cho người dùng.
+
+
+
 """
 
 
@@ -124,129 +135,99 @@ class ToolCallingAgent:
         return self._run_offline(user_input)
 
     def _run_with_gemini(self, prompt: str, api_key: str) -> Dict[str, Any]:
-        """Run a bounded ReAct loop using Gemini for thought/action selection."""
-        function_declarations = [
-            {
-                "name": tool["name"],
-                "description": tool.get("description", ""),
-                "parameters": tool.get("parameters", {}),
-            }
-            for tool in TOOL_DEFINITIONS
-            if tool.get("name") and tool.get("parameters")
-        ]
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT or None,
-            tools=[{"function_declarations": function_declarations}]
-            if function_declarations
-            else None,
-            temperature=0.2,
-        )
+        """Ask the LLM for intent, then dispatch the selected business tools."""
         client = genai.Client(api_key=api_key)
-        current_prompt = prompt
-        for iteration in range(1, self.max_iterations + 1):
-            response = client.models.generate_content(
-                model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
-                contents=current_prompt,
-                config=config,
-            )
-            function_calls = getattr(response, "function_calls", None)
-            if not function_calls:
-                answer = getattr(response, "text", "") or ""
-                self.trace.append(
-                    {"step": "final", "iteration": iteration, "type": "text", "content": answer}
-                )
-                return {
-                    "answer": answer,
-                    "trace": self.trace,
-                    "iterations": iteration,
-                    "status": "completed",
-                }
+        intent_definition = INTENT_DETECTION_DEFINITION
+        intent_config = types.GenerateContentConfig(
+            system_instruction=(
+                "Bạn là bộ phân loại intent. Bắt buộc gọi function intent_detection. "
+                "Trả JSON arguments gồm need_catalog, need_ticket, direct_answer. "
+                "Có thể chọn đồng thời need_catalog và need_ticket; direct_answer "
+                "chỉ đúng khi không cần tool."
+            ),
+            tools=[{"function_declarations": [intent_definition]}],
+            temperature=0,
+        )
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            contents=prompt,
+            config=intent_config,
+        )
+        function_calls = getattr(response, "function_calls", None) or []
+        if not function_calls or function_calls[0].name != "intent_detection":
+            raise ValueError("Intent model did not return intent_detection function call.")
 
-            call = function_calls[0]
-            tool_name = call.name
-            arguments = dict(call.args) if getattr(call, "args", None) else {}
-            tool = TOOL_MAP.get(tool_name)
-            if tool is None:
-                raise ValueError(f"Gemini requested an unknown tool: {tool_name}")
-            self.trace.append(
-                {
-                    "step": "thought",
-                    "iteration": iteration,
-                    "content": f"Gemini chọn công cụ {tool_name}.",
-                }
-            )
-            result = tool(**arguments)
-            observation = self._format_tool_answer(tool_name, result)
-            self.trace.append(
-                {
-                    "step": "action",
-                    "iteration": iteration,
-                    "tool": tool_name,
-                    "arguments": arguments,
-                }
-            )
-            self.trace.append(
-                {"step": "observation", "iteration": iteration, "content": observation}
-            )
-            current_prompt = (
-                f"{prompt}\n\nObservation từ {tool_name}: {observation}\n"
-                "Hãy tiếp tục ReAct. Nếu đã đủ thông tin, trả lời cuối cùng bằng văn bản; "
-                "nếu chưa đủ, hãy gọi công cụ tiếp theo."
-            )
+        arguments = dict(function_calls[0].args or {})
+        intent = detect_intent(**arguments)
+        self.trace.append({"step": "intent_detection", "source": "llm", "intent": intent})
 
-        error = f"Lỗi: Agent đã vượt quá số vòng lặp tối đa ({self.max_iterations})."
-        self.trace.append({"step": "error", "content": error})
-        return {
-            "answer": error,
-            "trace": self.trace,
-            "iterations": self.max_iterations,
-            "status": "max_iterations_reached",
-        }
+        if intent["direct_answer"] and not intent["need_catalog"] and not intent["need_ticket"]:
+            answer = self._ask_direct_answer(client, prompt)
+            self.trace.append({"step": "final", "iteration": 2, "content": answer})
+            return {"answer": answer, "trace": self.trace, "iterations": 2, "status": "completed"}
+
+        return self._execute_intent(prompt, intent)
+
+    def _ask_direct_answer(self, client: Any, user_input: str) -> str:
+        instructions = (
+            "Instructions: Trả lời trực tiếp user input bằng tiếng Việt. "
+            "Không gọi tool, không trả về JSON, không mô tả quy trình nội bộ. "
+            "Nếu câu hỏi cần dữ liệu mà bạn không có, hãy nói rõ giới hạn."
+        )
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            contents=f"{instructions}\n\nUser input:\n{user_input}",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                tools=None,
+                temperature=0.2,
+            ),
+        )
+        answer = getattr(response, "text", "") or ""
+        if not answer:
+            raise ValueError("Direct-answer model returned empty content.")
+        return answer
 
     def _run_offline(self, user_input: str) -> Dict[str, Any]:
-        """Run the explicit Intent Detection -> tools -> synthesis pipeline."""
+        """Fallback intent detection used when the LLM is unavailable."""
         text = user_input.lower()
-        needs_catalog = any(
-            word in text
-            for word in ("xe điện", "xe vinfast", "du lịch", "vinpearl", "resort")
+        intent = detect_intent(
+            need_catalog=any(
+                word in text
+                for word in ("xe điện", "xe vinfast", "du lịch", "vinpearl", "resort")
+            ),
+            need_ticket=any(
+                word in text
+                for word in ("bị lỗi", "hỗ trợ", "khiếu nại", "ticket", "sự cố")
+            ),
+            direct_answer="bảo hành" in text,
         )
-        needs_ticket = any(
-            word in text for word in ("bị lỗi", "hỗ trợ", "khiếu nại", "ticket", "sự cố")
-        )
-        is_faq = not needs_catalog and not needs_ticket and "bảo hành" in text
-        intent = {
-            "needs_catalog": needs_catalog,
-            "needs_ticket": needs_ticket,
-            "is_faq": is_faq,
-        }
         self.trace.append({"step": "intent_detection", "intent": intent})
 
-        if is_faq:
+        return self._execute_intent(user_input, intent)
+
+    def _execute_intent(self, user_input: str, intent: Dict[str, bool]) -> Dict[str, Any]:
+        text = user_input.lower()
+        if intent["direct_answer"] and not intent["need_catalog"] and not intent["need_ticket"]:
             answer = "Pin xe điện VinFast được bảo hành 10 năm."
             self.trace.append({"step": "final", "iteration": 1, "content": answer})
             return {"answer": answer, "trace": self.trace, "iterations": 1, "status": "completed"}
 
-        observations = []
-        if needs_catalog:
-            if self.max_iterations < 1:
-                return self._iteration_limit_error(1, ["search_product_catalog"])
-            observations.append(self._run_catalog(user_input, text, 1))
-        if needs_ticket:
-            if self.max_iterations < 2:
-                return self._iteration_limit_error(2, ["submit_support_ticket"])
-            observations.append(self._run_ticket(user_input, text, 2))
+        actions = []
+        if intent["need_catalog"]:
+            actions.append(("search_product_catalog", lambda: self._run_catalog(user_input, text, 2)))
+        if intent["need_ticket"]:
+            actions.append(("submit_support_ticket", lambda: self._run_ticket(user_input, text, 2)))
 
-        if not observations:
+        if not actions:
             answer = "Tôi chưa tìm thấy thông tin phù hợp. Vui lòng cung cấp thêm chi tiết."
             final_iteration = 1
-        elif len(observations) == 1:
-            answer = observations[0]
-            final_iteration = 1 if needs_catalog else 2
         else:
-            if self.max_iterations < 3:
-                return self._iteration_limit_error(3, [])
-            final_iteration = 3
-            answer = "Tổng hợp thông tin:\n" + "\n".join(observations)
+            if self.max_iterations < 1:
+                return self._iteration_limit_error(2, [name for name, _ in actions])
+            observations = self._run_tools_in_parallel(actions)
+            answer = observations[0] if len(observations) == 1 else "Tổng hợp thông tin:\n" + "\n".join(observations)
+            final_iteration = 2 if len(observations) == 1 else 3
 
         self.trace.append({"step": "final", "iteration": final_iteration, "content": answer})
         return {
@@ -255,6 +236,24 @@ class ToolCallingAgent:
             "iterations": final_iteration,
             "status": "completed",
         }
+
+    def _run_tools_in_parallel(self, actions: List[Any]) -> List[str]:
+        """Execute all selected business tools concurrently and preserve order."""
+        self.trace.append(
+            {
+                "step": "parallel_tool_execution",
+                "tools": [name for name, _ in actions],
+            }
+        )
+        observations = [None] * len(actions)
+        with ThreadPoolExecutor(max_workers=len(actions)) as executor:
+            futures = {
+                executor.submit(action): index
+                for index, (_, action) in enumerate(actions)
+            }
+            for future in as_completed(futures):
+                observations[futures[future]] = future.result()
+        return observations
 
     def _run_catalog(self, user_input: str, text: str, iteration: int) -> str:
         self.trace.append({"step": "thought", "iteration": iteration, "content": "Intent cần tra cứu catalog."})
@@ -305,6 +304,8 @@ class ToolCallingAgent:
             )
         return json.dumps(result, ensure_ascii=False)
 
+
+LoopingAgent = ToolCallingAgent
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN — Chạy thử nhanh
