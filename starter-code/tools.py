@@ -6,25 +6,6 @@ from datetime import datetime
 RAW_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "raw-data")
 
 # ---------------------------------------------------------------------------
-# Tool #0: detect_intent
-# ---------------------------------------------------------------------------
-
-def intent_detection(
-    need_catalog: bool = False,
-    need_ticket: bool = False,
-    direct_answer: bool = False,
-) -> Dict[str, bool]:
-    """Normalize the intent JSON returned by the intent-detection LLM tool."""
-    return {
-        "need_catalog": bool(need_catalog),
-        "need_ticket": bool(need_ticket),
-        "direct_answer": bool(direct_answer),
-    }
-
-
-detect_intent = intent_detection
-
-# ---------------------------------------------------------------------------
 # Tool #1: search_product_catalog
 # TODO: Hoàn thiện hàm này — đọc file product_catalog.json, lọc theo category và max_price.
 # ---------------------------------------------------------------------------
@@ -121,6 +102,20 @@ def submit_support_ticket(
 
 TOOL_DEFINITIONS = [
     {
+        "name": "direct_answer",
+        "description": "Trả lời trực tiếp câu hỏi của người dùng khi không cần gọi business tool.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string",
+                    "description": "Câu trả lời trực tiếp, súc tích bằng tiếng Việt."
+                }
+            },
+            "required": ["answer"]
+        }
+    },
+    {
         "name": "search_product_catalog",
         "description": "Tra cứu sản phẩm/dịch vụ Vingroup theo danh mục và giá tối đa.",
         "parameters": {
@@ -163,29 +158,7 @@ TOOL_DEFINITIONS = [
         }
     }
 ]
-
-INTENT_DETECTION_DEFINITION: Dict[str, Any] ={
-        "name": "intent_detection",
-        "description": "Phân loại ý định người dùng. Chọn một hoặc nhiều nhu cầu tool, hoặc direct_answer nếu cần trả lời trực tiếp.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "need_catalog": {"type": "boolean"},
-                "need_ticket": {"type": "boolean"},
-                "direct_answer": {"type": "boolean"}
-            },
-            "required": ["need_catalog", "need_ticket", "direct_answer"]
-        }
-}, 
-
-
-# ---------------------------------------------------------------------------
-# TOOL_MAP — Ánh xạ tên tool → hàm thực thi
-# ---------------------------------------------------------------------------
-
 TOOL_MAP = {
-    "intent_detection": intent_detection,
-    "detect_intent": intent_detection,
     "search_product_catalog": search_product_catalog,
     "submit_support_ticket": submit_support_ticket
 }

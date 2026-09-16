@@ -9,19 +9,12 @@ Kiến trúc:
 
 import json
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
 from tools import (
     TOOL_DEFINITIONS,
-    TOOL_MAP,
-    detect_intent,
     search_product_catalog,
     submit_support_ticket,
-    INTENT_DETECTION_DEFINITION
 )
 from google import genai
 from google.genai import types
@@ -124,64 +117,79 @@ class ToolCallingAgent:
         self.trace.append({"step": "init", "user_input": user_input})
 
         api_key = os.environ.get("GEMINI_API_KEY")
-        if api_key:
-            try:
-                return self._run_with_gemini(user_input, api_key)
-            except Exception as exc:
-                # Keep the lab runnable without a network connection or a
-                # model that does not support function calling.
-                self.trace.append({"step": "provider_fallback", "error": str(exc)})
-
-        return self._run_offline(user_input)
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set.")
+        return self._run_with_gemini(user_input, api_key)
 
     def _run_with_gemini(self, prompt: str, api_key: str) -> Dict[str, Any]:
-        """Ask the LLM for intent, then dispatch the selected business tools."""
+        """Select tools and arguments with Gemini, then execute and synthesize."""
         client = genai.Client(api_key=api_key)
-        intent_definition = INTENT_DETECTION_DEFINITION
-        intent_config = types.GenerateContentConfig(
+        selection_config = types.GenerateContentConfig(
             system_instruction=(
-                "Bạn là bộ phân loại intent. Bắt buộc gọi function intent_detection. "
-                "Trả JSON arguments gồm need_catalog, need_ticket, direct_answer. "
-                "Có thể chọn đồng thời need_catalog và need_ticket; direct_answer "
-                "chỉ đúng khi không cần tool."
+                "Phân tích user input và gọi một hoặc nhiều function phù hợp. "
+                "Trích xuất đầy đủ arguments cho từng function. "
+                "Nếu trả lời trực tiếp, gọi direct_answer với argument answer súc tích. "
+                "Không gọi direct_answer cùng business tool."
             ),
-            tools=[{"function_declarations": [intent_definition]}],
+            tools=[{"function_declarations": TOOL_DEFINITIONS}],
             temperature=0,
         )
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             contents=prompt,
-            config=intent_config,
+            config=selection_config,
         )
         function_calls = getattr(response, "function_calls", None) or []
-        if not function_calls or function_calls[0].name != "intent_detection":
-            raise ValueError("Intent model did not return intent_detection function call.")
+        if not function_calls:
+            raise ValueError("Tool-selection model returned no function call.")
 
-        arguments = dict(function_calls[0].args or {})
-        intent = detect_intent(**arguments)
-        self.trace.append({"step": "intent_detection", "source": "llm", "intent": intent})
+        selected = []
+        for call in function_calls:
+            name = call.name
+            arguments = dict(call.args or {})
+            self.trace.append(
+                {"step": "tool_selection", "source": "llm", "tool": name, "arguments": arguments}
+            )
+            if name == "direct_answer":
+                answer = arguments.get("answer", "").strip()
+                if not answer:
+                    raise ValueError("direct_answer returned an empty answer.")
+                self.trace.append({"step": "final", "iteration": 1, "content": answer})
+                return {"answer": answer, "trace": self.trace, "iterations": 1, "status": "completed"}
+            if name not in ("search_product_catalog", "submit_support_ticket"):
+                raise ValueError(f"Unknown selected tool: {name}")
+            selected.append((name, arguments))
 
-        if intent["direct_answer"] and not intent["need_catalog"] and not intent["need_ticket"]:
-            answer = self._ask_direct_answer(client, prompt)
-            self.trace.append({"step": "final", "iteration": 2, "content": answer})
-            return {"answer": answer, "trace": self.trace, "iterations": 2, "status": "completed"}
+        actions = []
+        for name, arguments in selected:
+            if name == "search_product_catalog":
+                actions.append(
+                    (name, lambda args=arguments: self._run_catalog(prompt, prompt.lower(), 2, args))
+                )
+            else:
+                actions.append(
+                    (name, lambda args=arguments: self._run_ticket(prompt, prompt.lower(), 2, args))
+                )
+        observations = self._run_tools_in_parallel(actions)
+        final_answer = self._synthesize_answer(client, prompt, observations)
+        final_iteration = 3 if len(observations) > 1 else 2
+        self.trace.append({"step": "final", "iteration": final_iteration, "content": final_answer})
+        return {
+            "answer": final_answer,
+            "trace": self.trace,
+            "iterations": final_iteration,
+            "status": "completed",
+        }
 
-        return self._execute_intent(prompt, intent)
-
-    def _ask_direct_answer(self, client: Any, user_input: str) -> str:
-        instructions = (
-            "Trả lời trực tiếp user input bằng tiếng Việt. "
-            "Không gọi tool, không trả về JSON, không mô tả quy trình nội bộ. "
-            "Nếu câu hỏi cần dữ liệu mà bạn không có, hãy nói rõ giới hạn."
-        )
-
-        if not client:
-            api_key = os.environ.get("GEMINI_API_KEY", None)
-            client = genai.Client(api_key=api_key)
-        
+    def _synthesize_answer(self, client: Any, user_input: str, observations: List[str]) -> str:
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-            contents=f"Instructions:{instructions}\n\nUser input:\n{user_input}",
+            contents=(
+                "Instructions: Trả lời cuối cùng bằng tiếng Việt dựa trên user input "
+                "và kết quả tool. Không gọi tool, không bịa dữ liệu.\n\n"
+                f"User input:\n{user_input}\n\nTool results:\n"
+                + "\n".join(observations)
+            ),
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 tools=None,
@@ -190,57 +198,8 @@ class ToolCallingAgent:
         )
         answer = getattr(response, "text", "") or ""
         if not answer:
-            raise ValueError("Direct-answer model returned empty content.")
+            raise ValueError("Synthesis model returned empty content.")
         return answer
-
-    def _run_offline(self, user_input: str) -> Dict[str, Any]:
-        """Fallback intent detection used when the LLM is unavailable."""
-        text = user_input.lower()
-        intent = detect_intent(
-            need_catalog=any(
-                word in text
-                for word in ("xe điện", "xe vinfast", "du lịch", "vinpearl", "resort")
-            ),
-            need_ticket=any(
-                word in text
-                for word in ("bị lỗi", "hỗ trợ", "khiếu nại", "ticket", "sự cố")
-            ),
-            direct_answer="bảo hành" in text,
-        )
-        self.trace.append({"step": "intent_detection", "intent": intent})
-
-        return self._execute_intent(user_input, intent)
-
-    def _execute_intent(self, user_input: str, intent: Dict[str, bool]) -> Dict[str, Any]:
-        text = user_input.lower()
-        if intent["direct_answer"] and not intent["need_catalog"] and not intent["need_ticket"]:
-            answer = self._ask_direct_answer(None, user_input)
-            self.trace.append({"step": "final", "iteration": 1, "content": answer})
-            return {"answer": answer, "trace": self.trace, "iterations": 1, "status": "completed"}
-
-        actions = []
-        if intent["need_catalog"]:
-            actions.append(("search_product_catalog", lambda: self._run_catalog(user_input, text, 2)))
-        if intent["need_ticket"]:
-            actions.append(("submit_support_ticket", lambda: self._run_ticket(user_input, text, 2)))
-
-        if not actions:
-            answer = "Tôi chưa tìm thấy thông tin phù hợp. Vui lòng cung cấp thêm chi tiết."
-            final_iteration = 1
-        else:
-            if self.max_iterations < 1:
-                return self._iteration_limit_error(2, [name for name, _ in actions])
-            observations = self._run_tools_in_parallel(actions)
-            answer = observations[0] if len(observations) == 1 else "Tổng hợp thông tin:\n" + "\n".join(observations)
-            final_iteration = 2 if len(observations) == 1 else 3
-
-        self.trace.append({"step": "final", "iteration": final_iteration, "content": answer})
-        return {
-            "answer": answer,
-            "trace": self.trace,
-            "iterations": final_iteration,
-            "status": "completed",
-        }
 
     def _run_tools_in_parallel(self, actions: List[Any]) -> List[str]:
         """Execute all selected business tools concurrently and preserve order."""
@@ -260,24 +219,26 @@ class ToolCallingAgent:
                 observations[futures[future]] = future.result()
         return observations
 
-    def _run_catalog(self, user_input: str, text: str, iteration: int) -> str:
+    def _run_catalog(self, user_input: str, text: str, iteration: int, arguments: Dict[str, Any] = None) -> str:
         self.trace.append({"step": "thought", "iteration": iteration, "content": "Intent cần tra cứu catalog."})
-        category = "du_lich" if any(word in text for word in ("du lịch", "vinpearl", "resort")) else "xe_dien"
-        max_price = 999999999999
-        price_match = re.search(r"(\d+(?:[.,]\d+)?)\s*(tỷ|triệu)", text)
-        if price_match:
-            amount = float(price_match.group(1).replace(",", "."))
-            max_price = int(amount * (1000000000 if price_match.group(2) == "tỷ" else 1000000))
-        arguments = {"category": category, "max_price": max_price}
+        if arguments is None:
+            category = "du_lich" if any(word in text for word in ("du lịch", "vinpearl", "resort")) else "xe_dien"
+            max_price = 999999999999
+            price_match = re.search(r"(\d+(?:[.,]\d+)?)\s*(tỷ|triệu)", text)
+            if price_match:
+                amount = float(price_match.group(1).replace(",", "."))
+                max_price = int(amount * (1000000000 if price_match.group(2) == "tỷ" else 1000000))
+            arguments = {"category": category, "max_price": max_price}
         result = search_product_catalog(**arguments)
         return self._record_tool_result("search_product_catalog", arguments, result, iteration)
 
-    def _run_ticket(self, user_input: str, text: str, iteration: int) -> str:
+    def _run_ticket(self, user_input: str, text: str, iteration: int, arguments: Dict[str, Any] = None) -> str:
         self.trace.append({"step": "thought", "iteration": iteration, "content": "Intent cần tạo support ticket."})
-        name_match = re.search(r"(?:tôi tên|tên tôi là)\s+([^,.]+)", user_input, re.IGNORECASE)
-        customer_name = name_match.group(1).strip() if name_match else "Khách hàng"
-        priority = "high" if any(word in text for word in ("gấp", "nghiêm trọng", "khẩn")) else "medium"
-        arguments = {"customer_name": customer_name, "issue_description": user_input, "priority": priority}
+        if arguments is None:
+            name_match = re.search(r"(?:tôi tên|tên tôi là)\s+([^,.]+)", user_input, re.IGNORECASE)
+            customer_name = name_match.group(1).strip() if name_match else "Khách hàng"
+            priority = "high" if any(word in text for word in ("gấp", "nghiêm trọng", "khẩn")) else "medium"
+            arguments = {"customer_name": customer_name, "issue_description": user_input, "priority": priority}
         result = submit_support_ticket(**arguments)
         return self._record_tool_result("submit_support_ticket", arguments, result, iteration)
 
@@ -286,12 +247,6 @@ class ToolCallingAgent:
         self.trace.append({"step": "action", "iteration": iteration, "tool": tool_name, "arguments": arguments})
         self.trace.append({"step": "observation", "iteration": iteration, "content": observation})
         return observation
-
-    def _iteration_limit_error(self, iteration: int, pending: List[str]) -> Dict[str, Any]:
-        suffix = f" Chưa thực hiện: {', '.join(pending)}." if pending else ""
-        answer = f"Lỗi: Agent đã vượt quá số vòng lặp tối đa ({self.max_iterations}).{suffix}"
-        self.trace.append({"step": "error", "iteration": iteration, "content": answer})
-        return {"answer": answer, "trace": self.trace, "iterations": self.max_iterations, "status": "max_iterations_reached"}
 
     @staticmethod
     def _format_tool_answer(tool_name: str, result: Any) -> str:
@@ -309,18 +264,12 @@ class ToolCallingAgent:
             )
         return json.dumps(result, ensure_ascii=False)
 
-
-LoopingAgent = ToolCallingAgent
-
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN — Chạy thử nhanh
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     user_query = "Tôi muốn xem xe điện VinFast giá dưới 600 triệu."
-
-    from dotenv import load_dotenv
-    load_dotenv()  # Load GEMINI_API_KEY từ .env nếu có
 
     print("=== RUNNING CHATBOT BASELINE ===")
     chatbot = ChatbotBaseline()
@@ -334,3 +283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+LoopingAgent = ToolCallingAgent
