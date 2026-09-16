@@ -170,13 +170,18 @@ class ToolCallingAgent:
 
     def _ask_direct_answer(self, client: Any, user_input: str) -> str:
         instructions = (
-            "Instructions: Trả lời trực tiếp user input bằng tiếng Việt. "
+            "Trả lời trực tiếp user input bằng tiếng Việt. "
             "Không gọi tool, không trả về JSON, không mô tả quy trình nội bộ. "
             "Nếu câu hỏi cần dữ liệu mà bạn không có, hãy nói rõ giới hạn."
         )
+
+        if not client:
+            api_key = os.environ.get("GEMINI_API_KEY", None)
+            client = genai.Client(api_key=api_key)
+        
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-            contents=f"{instructions}\n\nUser input:\n{user_input}",
+            contents=f"Instructions:{instructions}\n\nUser input:\n{user_input}",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 tools=None,
@@ -209,7 +214,7 @@ class ToolCallingAgent:
     def _execute_intent(self, user_input: str, intent: Dict[str, bool]) -> Dict[str, Any]:
         text = user_input.lower()
         if intent["direct_answer"] and not intent["need_catalog"] and not intent["need_ticket"]:
-            answer = "Pin xe điện VinFast được bảo hành 10 năm."
+            answer = self._ask_direct_answer(None, user_input)
             self.trace.append({"step": "final", "iteration": 1, "content": answer})
             return {"answer": answer, "trace": self.trace, "iterations": 1, "status": "completed"}
 
